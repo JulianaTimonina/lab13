@@ -1,0 +1,5 @@
+nats-py
+groq
+opentelemetry-sdk
+opentelemetry-exporter-otlp-proto-grpc
+protobuf>=3.20

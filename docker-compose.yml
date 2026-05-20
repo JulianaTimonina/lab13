@@ -1,0 +1,81 @@
+version: '3.8'
+
+services:
+  nats:
+    image: nats:2.10-alpine
+    command: "-js"
+    ports:
+      - "4222:4222"
+
+  redis:
+    image: redis:alpine
+    ports:
+      - "6379:6379"
+
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - "16686:16686"
+      - "4317:4317"
+      - "4318:4318"
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+
+  data-collector:
+    build:
+      context: .
+      dockerfile: agents/data-collector/Dockerfile
+    depends_on:
+      - nats
+
+  income-analyzer:
+    build:
+      context: .
+      dockerfile: agents/income-analyzer/Dockerfile
+    depends_on:
+      - nats
+
+  risk-evaluator:
+    build:
+      context: .
+      dockerfile: agents/risk-evaluator/Dockerfile
+    depends_on:
+      - nats
+      - redis
+
+  decision-maker:
+    build:
+      context: .
+      dockerfile: agents/decision-maker/Dockerfile
+    depends_on:
+      - nats
+
+  orchestrator:
+    build:
+      context: .
+      dockerfile: orchestrator/Dockerfile
+    depends_on:
+      - nats
+      - redis
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  llm-agent:
+    build:
+      context: .
+      dockerfile: agents/llm-agent/Dockerfile
+    depends_on:
+      - nats
+      - jaeger
+    environment:
+      - GROQ_API_KEY=${GROQ_API_KEY}
+
+  web-ui:
+    build:
+      context: .
+      dockerfile: web-ui/Dockerfile
+    ports:
+      - "8501:8501"
+    depends_on:
+      - nats
+      - redis
