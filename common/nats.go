@@ -13,16 +13,25 @@ func ConnectNATS() (*nats.Conn, nats.JetStreamContext, error) {
     if err != nil {
         return nil, nil, err
     }
-    // Удаляем старый поток, если он существует (ошибку игнорируем)
-    js.DeleteStream("SCORING")
-    // Создаём поток с актуальными subject'ами
-    _, err = js.AddStream(&nats.StreamConfig{
-        Name:      "SCORING",
-        Subjects:  []string{"income.analyze.do", "risk.analyze.do", "decision.make", "llm.explain"},
-        Retention: nats.WorkQueuePolicy,
-    })
-    if err != nil {
-        return nil, nil, err
-    }
+    // Проверяем существует ли stream
+	_, err = js.StreamInfo("SCORING")
+
+	if err != nil {
+		// Stream не существует — создаём
+		_, err = js.AddStream(&nats.StreamConfig{
+			Name: "SCORING",
+			Subjects: []string{
+				"income.analyze.do",
+				"risk.analyze.do",
+				"decision.make",
+				"llm.explain",
+			},
+			Retention: nats.WorkQueuePolicy,
+		})
+
+		if err != nil {
+			return nil, nil, err
+		}
+	}
     return nc, js, nil
 }
