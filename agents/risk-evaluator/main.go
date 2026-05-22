@@ -36,7 +36,7 @@ func main() {
     rdb = common.NewRedisClient()
     loadState(ctx)
 
-    nc, js, err := common.ConnectNATS()
+    nc, _, err := common.ConnectNATS()
     if err != nil {
         log.Fatal(err)
     }
@@ -54,7 +54,7 @@ func main() {
     })
 
     // Рабочая очередь
-    _, err = js.QueueSubscribe("risk.analyze.do", "risk-workers", func(msg *nats.Msg) {
+    _, err = nc.QueueSubscribe("risk.analyze.do", "risk-workers", func(msg *nats.Msg) {
         _, span := tracer.Start(context.Background(), "process-risk-evaluation")
         defer span.End()
 
@@ -69,14 +69,13 @@ func main() {
         }
         resp, _ := json.Marshal(assessment)
         nc.Publish(msg.Reply, resp)
-        msg.Ack()
 
         stateMutex.Lock()
         state.TotalEvaluated++
         state.LastEvaluated = time.Now()
         stateMutex.Unlock()
         saveState(ctx)
-    }, nats.ManualAck())
+    })
     if err != nil {
         log.Fatal(err)
     }

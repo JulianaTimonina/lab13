@@ -45,7 +45,7 @@ func main() {
             CreditHistory:  "good",
         }
         resp, _ := json.Marshal(data)
-        nc.Publish(msg.Reply, resp)
+        msg.Respond(resp)
     })
     if err != nil {
         log.Fatal(err)

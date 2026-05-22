@@ -19,13 +19,13 @@ func main() {
     }
     defer tp.Shutdown(ctx)
 
-    nc, js, err := common.ConnectNATS()
+    nc, _, err := common.ConnectNATS()
     if err != nil {
         log.Fatal(err)
     }
     defer nc.Close()
 
-    _, err = js.QueueSubscribe("decision.make", "decision-workers", func(msg *nats.Msg) {
+    _, err = nc.QueueSubscribe("decision.make", "decision-workers", func(msg *nats.Msg) {
         _, span := tracer.Start(context.Background(), "make-decision")
         defer span.End()
 
@@ -45,9 +45,8 @@ func main() {
             Reason:   "Good risk profile",
         }
         resp, _ := json.Marshal(decision)
-        nc.Publish(msg.Reply, resp)
-        msg.Ack()
-    }, nats.ManualAck())
+        msg.Respond(resp)
+    })
     if err != nil {
         log.Fatal(err)
     }

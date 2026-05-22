@@ -24,7 +24,7 @@ func main() {
     }
     defer tp.Shutdown(ctx)
 
-    nc, js, err := common.ConnectNATS()
+    nc, _, err := common.ConnectNATS()
     if err != nil {
         log.Fatal(err)
     }
@@ -44,7 +44,7 @@ func main() {
     })
 
     // Рабочая очередь
-    _, err = js.QueueSubscribe("income.analyze.do", "income-workers", func(msg *nats.Msg) {
+    _, err = nc.QueueSubscribe("income.analyze.do", "income-workers", func(msg *nats.Msg) {
         atomic.AddInt64(&currentLoad, 1)
         defer atomic.AddInt64(&currentLoad, -1)
 
@@ -65,8 +65,7 @@ func main() {
         }
         resp, _ := json.Marshal(analysis)
         nc.Publish(msg.Reply, resp)
-        msg.Ack()
-    }, nats.ManualAck())
+    })
     if err != nil {
         log.Fatal(err)
     }
