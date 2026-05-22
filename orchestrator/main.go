@@ -49,20 +49,32 @@ func main() {
         }
 
         incomeMap, err := directStep(ctx, nc, "income", clientData)
-        if err != nil {
-            nc.Publish(msg.Reply, []byte(`{"error":"income analysis failed"}`))
-            return
-        }
-        var incomeAnalysis common.IncomeAnalysis
-        mapToStruct(incomeMap, &incomeAnalysis)
+		if err != nil {
+			nc.Publish(msg.Reply, []byte(`{"error":"income analysis failed"}`))
+			return
+		}
 
-        riskMap, err := directStep(ctx, nc, "risk", clientData)
-        if err != nil {
-            nc.Publish(msg.Reply, []byte(`{"error":"risk assessment failed"}`))
-            return
-        }
-        var riskAssessment common.RiskAssessment
-        mapToStruct(riskMap, &riskAssessment)
+		var incomeAnalysis common.IncomeAnalysis
+
+		if err := mapToStruct(incomeMap, &incomeAnalysis); err != nil {
+			log.Printf("income mapToStruct error: %v", err)
+			nc.Publish(msg.Reply, []byte(`{"error":"income parse failed"}`))
+			return
+		}
+
+		riskMap, err := directStep(ctx, nc, "risk", clientData)
+		if err != nil {
+			nc.Publish(msg.Reply, []byte(`{"error":"risk assessment failed"}`))
+			return
+		}
+
+		var riskAssessment common.RiskAssessment
+
+		if err := mapToStruct(riskMap, &riskAssessment); err != nil {
+			log.Printf("risk mapToStruct error: %v", err)
+			nc.Publish(msg.Reply, []byte(`{"error":"risk parse failed"}`))
+			return
+		}
 
         decision, err := makeDecision(ctx, nc, incomeAnalysis, riskAssessment)
         if err != nil {
@@ -114,12 +126,19 @@ func directStep(ctx context.Context, nc *nats.Conn, stepType string, data interf
     doSubject := stepType + ".analyze.do"
     workReq, _ := json.Marshal(data)
 
+	log.Printf("Sending request to %s", doSubject)
     resp, err := nc.Request(doSubject, workReq, 10*time.Second)
     if err != nil {
+		log.Printf("Request error for %s: %v", doSubject, err)
         return nil, err
     }
+	log.Printf("Received response from %s: %s", doSubject, string(resp.Data))
     var result map[string]interface{}
-    json.Unmarshal(resp.Data, &result)
+    if err := json.Unmarshal(resp.Data, &result); err != nil {
+		log.Printf("directStep unmarshal error: %v", err)
+		log.Printf("raw response: %s", string(resp.Data))
+		return nil, err
+	}
     return result, nil
 }
 
@@ -131,8 +150,14 @@ func makeDecision(ctx context.Context, nc *nats.Conn, income common.IncomeAnalys
     if err != nil {
         return nil, err
     }
+    log.Printf("RAW decision response: %s", string(resp.Data))
+
     var decision common.Decision
+
     err = json.Unmarshal(resp.Data, &decision)
+
+    log.Printf("PARSED decision: %+v", decision)
+
     return &decision, err
 }
 
@@ -181,7 +206,15 @@ func scalerLoop(ctx context.Context, nc *nats.Conn) {
     }
 }
 
-func mapToStruct(m map[string]interface{}, s interface{}) {
-    data, _ := json.Marshal(m)
-    json.Unmarshal(data, s)
+func mapToStruct(m map[string]interface{}, s interface{}) error {
+    data, err := json.Marshal(m)
+    if err != nil {
+        return err
+    }
+
+    if err := json.Unmarshal(data, s); err != nil {
+        return err
+    }
+
+    return nil
 }

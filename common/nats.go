@@ -17,14 +17,10 @@ func ConnectNATS() (*nats.Conn, nats.JetStreamContext, error) {
 	_, err = js.StreamInfo("SCORING")
 
 	if err != nil {
-		// Stream не существует — создаём
 		_, err = js.AddStream(&nats.StreamConfig{
 			Name: "SCORING",
 			Subjects: []string{
-				"income.analyze.do",
-				"risk.analyze.do",
-				"decision.make",
-				"llm.explain",
+				"events.>",
 			},
 			Retention: nats.WorkQueuePolicy,
 		})

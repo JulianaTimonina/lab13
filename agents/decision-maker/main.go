@@ -26,7 +26,8 @@ func main() {
     defer nc.Close()
 
     _, err = nc.QueueSubscribe("decision.make", "decision-workers", func(msg *nats.Msg) {
-        _, span := tracer.Start(context.Background(), "make-decision")
+        log.Printf("Decision request received: %s", string(msg.Data))
+		_, span := tracer.Start(context.Background(), "make-decision")
         defer span.End()
 
         var input struct {

@@ -55,11 +55,16 @@ func main() {
 
     // Рабочая очередь
     _, err = nc.QueueSubscribe("risk.analyze.do", "risk-workers", func(msg *nats.Msg) {
+		log.Printf("Received risk request: %s", string(msg.Data))
         _, span := tracer.Start(context.Background(), "process-risk-evaluation")
         defer span.End()
 
         var data common.ClientData
-        json.Unmarshal(msg.Data, &data)
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			log.Printf("Unmarshal error: %v", err)
+			return
+		}
+		log.Printf("Parsed client: %+v", data)
         span.SetAttributes(attribute.String("client_id", data.ClientID))
 
         assessment := common.RiskAssessment{
@@ -68,7 +73,8 @@ func main() {
             Factors:   []string{"good credit history", "stable income"},
         }
         resp, _ := json.Marshal(assessment)
-        nc.Publish(msg.Reply, resp)
+		log.Printf("Sending assessment: %+v", assessment)
+        msg.Respond(resp)
 
         stateMutex.Lock()
         state.TotalEvaluated++
