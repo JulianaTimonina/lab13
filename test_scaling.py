@@ -1,133 +1,291 @@
-#!/usr/bin/env python3
+# test_scaling.py
 """
-Скрипт для тестирования динамического масштабирования агентов.
-Перед запуском убедитесь, что система запущена (docker compose up -d) и
-агенты замедлены (time.Sleep(2*time.Second) внутри income-analyzer/risk-evaluator).
+Pytest-тесты динамического масштабирования агентов.
+Требования:
+- система поднята через docker compose up -d
+- внутри income-analyzer/risk-evaluator есть искусственная задержка (time.Sleep(2*time.Second))
+- доступен Docker (метки compose) и порт оркестратора 8080
 """
+import pytest
 import subprocess
 import time
-import sys
 import requests
 from concurrent.futures import ThreadPoolExecutor
 
 BASE_URL = "http://localhost:8080"
-NUM_REQUESTS = 30          # Количество параллельных задач
-CHECK_INTERVAL = 5         # Пауза между проверками состояния контейнеров
-MAX_WAIT_SCALE_UP = 60     # Максимальное время ожидания масштабирования вверх (сек)
-MAX_WAIT_SCALE_DOWN = 120  # Максимальное время ожидания масштабирования вниз (сек)
+NUM_REQUESTS = 30
+CHECK_INTERVAL = 5
+MAX_WAIT_SCALE_UP = 60
+MAX_WAIT_SCALE_DOWN = 120
+MAX_REPLICAS = 5  # как maxIncomeReplicas / maxRiskReplicas в orchestrator
 
-def docker_ps_count(service_name):
-    """Возвращает количество работающих контейнеров с заданной меткой сервиса."""
+
+def get_compose_project() -> str:
+    """Имя compose-проекта (например lab13_3) по контейнеру orchestrator."""
+    result = subprocess.run(
+        [
+            "docker", "ps", "-q",
+            "--filter", "label=com.docker.compose.service=orchestrator",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    cid = result.stdout.strip().split()[0]
+    if not cid:
+        pytest.fail("Контейнер orchestrator не найден — сначала: docker compose up -d")
+    result = subprocess.run(
+        ["docker", "inspect", "-f", "{{index .Config.Labels \"com.docker.compose.project\"}}", cid],
+        capture_output=True, text=True, check=True,
+    )
+    project = result.stdout.strip()
+    if not project:
+        pytest.fail("Не удалось определить compose project")
+    return project
+
+
+def list_running_service_containers(service_name: str) -> list[str]:
+    result = subprocess.run(
+        [
+            "docker", "ps",
+            "--filter", f"label=com.docker.compose.service={service_name}",
+            "--format", "{{.Names}}",
+        ],
+        capture_output=True, text=True, check=True,
+    )
+    return [l.strip() for l in result.stdout.splitlines() if l.strip()]
+
+
+def base_compose_container(service_name: str, names: list[str]) -> str | None:
+    """Базовый контейнер compose: *-income-analyzer-1 (не income-analyzer-1779...)."""
+    suffix = f"-{service_name}-1"
+    matches = [n for n in names if n.endswith(suffix)]
+    return matches[0] if matches else None
+
+
+def prune_scaled_workers(service_name: str) -> int:
+    """Останавливает лишние воркеры. Возвращает число остановленных."""
+    names = list_running_service_containers(service_name)
+    keep = base_compose_container(service_name, names)
+    if not keep:
+        return 0
+    stopped = 0
+    for name in names:
+        if name != keep:
+            subprocess.run(["docker", "stop", "-t", "3", name], capture_output=True, check=False)
+            stopped += 1
+    return stopped
+
+
+def reset_scaler_redis_counters(project: str) -> None:
+    redis = f"{project}-redis-1"
+    subprocess.run(
+        ["docker", "exec", redis, "redis-cli", "DEL", "scaler:active_income", "scaler:active_risk"],
+        capture_output=True,
+        check=False,
+    )
+
+
+def ensure_baseline_workers(project: str, timeout: int = 90) -> None:
+    """Доводит до 1 базового воркера на сервис; иначе оркестратор снова scale-up."""
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        reset_scaler_redis_counters(project)
+        prune_scaled_workers("income-analyzer")
+        prune_scaled_workers("risk-evaluator")
+        income = docker_ps_count("income-analyzer")
+        risk = docker_ps_count("risk-evaluator")
+        if income < MAX_REPLICAS and risk < MAX_REPLICAS:
+            return
+        time.sleep(3)
+    pytest.fail(
+        f"Не удалось сбросить воркеры за {timeout} с "
+        f"(income={docker_ps_count('income-analyzer')}, risk={docker_ps_count('risk-evaluator')}). "
+        "Остановите лишние контейнеры вручную или: docker compose -p lab13_3 down"
+    )
+
+
+def docker_ps_count(service_name: str) -> int:
+    """Возвращает количество запущенных контейнеров сервиса по compose-метке."""
     try:
         result = subprocess.run(
-            ["docker", "ps", "--filter", f"label=com.docker.compose.service={service_name}",
-             "--format", "{{.Names}}"],
+            [
+                "docker", "ps",
+                "--filter", f"label=com.docker.compose.service={service_name}",
+                "--format", "{{.Names}}"
+            ],
             capture_output=True, text=True, check=True
         )
-        lines = [line.strip() for line in result.stdout.split("\n") if line.strip()]
+        lines = [l.strip() for l in result.stdout.split("\n") if l.strip()]
         return len(lines)
     except subprocess.CalledProcessError as e:
-        print(f"[ERROR] docker ps failed: {e}")
-        return 0
+        pytest.fail(f"docker ps failed: {e}")
 
-def send_request(client_id):
-    """Отправляет один POST-запрос к оркестратору."""
+
+def send_request(client_id: str):
+    """Отправляет POST /start и возвращает task_id или None."""
     try:
         resp = requests.post(f"{BASE_URL}/start", json={"client_id": client_id}, timeout=5)
         if resp.status_code == 200:
             return resp.json().get("task_id")
         else:
-            print(f"[WARN] Request {client_id} returned {resp.status_code}")
             return None
-    except Exception as e:
-        print(f"[ERROR] Request {client_id} failed: {e}")
+    except Exception:
         return None
 
-def wait_for_scale_up(service_name, initial_count, timeout=MAX_WAIT_SCALE_UP):
-    """Ждёт увеличения количества контейнеров до > initial_count."""
-    print(f"[INFO] Waiting for {service_name} to scale up (initial count: {initial_count})...")
+
+def redis_active_count(project: str, key: str) -> int:
+    redis = f"{project}-redis-1"
+    result = subprocess.run(
+        ["docker", "exec", redis, "redis-cli", "GET", key],
+        capture_output=True, text=True, check=False,
+    )
+    val = result.stdout.strip()
+    return int(val) if val.isdigit() else 0
+
+
+def wait_for(predicate, timeout: int, description: str):
+    """Утилита активного ожидания с assert-ом в случае таймаута."""
     start = time.time()
     while time.time() - start < timeout:
-        current = docker_ps_count(service_name)
-        print(f"       {service_name}: current={current}, initial={initial_count}")
-        if current > initial_count:
-            print(f"[OK] {service_name} scaled up to {current} containers after {time.time()-start:.1f}s")
+        if predicate():
             return True
         time.sleep(CHECK_INTERVAL)
-    print(f"[FAIL] {service_name} did NOT scale up within {timeout}s")
-    return False
+    pytest.fail(f"{description} не выполнено за {timeout} секунд")
 
-def wait_for_scale_down(service_name, initial_count, timeout=MAX_WAIT_SCALE_DOWN):
-    """Ждёт возврата количества контейнеров к initial_count (или меньше)."""
-    print(f"[INFO] Waiting for {service_name} to scale down (target: <= {initial_count})...")
-    start = time.time()
-    while time.time() - start < timeout:
-        current = docker_ps_count(service_name)
-        print(f"       {service_name}: current={current}, target<={initial_count}")
-        if current <= initial_count:
-            print(f"[OK] {service_name} scaled down to {current} containers after {time.time()-start:.1f}s")
-            return True
-        time.sleep(CHECK_INTERVAL)
-    print(f"[FAIL] {service_name} did NOT scale down within {timeout}s")
-    return False
 
-def check_orchestrator_logs():
-    """Проверяет наличие ключевых сообщений в логах оркестратора."""
-    try:
-        result = subprocess.run(
-            ["docker", "logs", "orchestrator"],
-            capture_output=True, text=True
+class TestDynamicScaling:
+    """Группа тестов, проверяющих реакцию оркестратора на нагрузку."""
+
+    @pytest.fixture(scope="class", autouse=True)
+    def reset_workers_before_tests(self):
+        """
+        Убирает «зависшие» контейнеры от прошлых прогонов (income-analyzer-17...).
+        Иначе initial=5 и scale-up тесты не могут пройти — лимит уже достигнут.
+        """
+        project = get_compose_project()
+        ensure_baseline_workers(project)
+        yield
+        # после тестов тоже прибираем, чтобы не мешать следующему запуску
+        ensure_baseline_workers(project, timeout=120)
+
+    @pytest.fixture(autouse=True)
+    def setup(self):
+        """Сохраняет начальное количество воркеров перед каждым тестом."""
+        self.initial_income = docker_ps_count("income-analyzer")
+        self.initial_risk = docker_ps_count("risk-evaluator")
+        assert self.initial_income > 0, "income-analyzer должен быть запущен"
+        assert self.initial_risk > 0, "risk-evaluator должен быть запущен"
+        if self.initial_income >= MAX_REPLICAS or self.initial_risk >= MAX_REPLICAS:
+            project = get_compose_project()
+            ensure_baseline_workers(project)
+            self.initial_income = docker_ps_count("income-analyzer")
+            self.initial_risk = docker_ps_count("risk-evaluator")
+        if self.initial_income >= MAX_REPLICAS:
+            pytest.fail(
+                f"income-analyzer всё ещё {self.initial_income} шт. (макс. {MAX_REPLICAS}). "
+                "Остановите лишние или перезапустите stack."
+            )
+        if self.initial_risk >= MAX_REPLICAS:
+            pytest.fail(
+                f"risk-evaluator всё ещё {self.initial_risk} шт. (макс. {MAX_REPLICAS}). "
+                "Остановите лишние воркеры или перезапустите stack."
+            )
+
+    def test_scale_up_income_analyzer(self):
+        """Отправка 30 параллельных запросов должна вызвать увеличение контейнеров income-analyzer."""
+        with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
+            futures = [executor.submit(send_request, f"load-{i}") for i in range(NUM_REQUESTS)]
+            results = [f.result() for f in futures]
+        successful = [r for r in results if r]
+        assert len(successful) == NUM_REQUESTS, (
+            f"Не все запросы успешны: {len(successful)}/{NUM_REQUESTS}"
         )
-        logs = result.stdout
-        if "Scaling UP income-analyzer" in logs and "Scaling UP risk-evaluator" in logs:
-            print("[OK] Found 'Scaling UP' messages in orchestrator logs")
-        else:
-            print("[WARN] Missing 'Scaling UP' messages in orchestrator logs")
-        if "Scaling DOWN income-analyzer" in logs and "Scaling DOWN risk-evaluator" in logs:
-            print("[OK] Found 'Scaling DOWN' messages in orchestrator logs")
-        else:
-            print("[WARN] Missing 'Scaling DOWN' messages in orchestrator logs")
-    except subprocess.CalledProcessError:
-        print("[ERROR] Unable to read orchestrator logs")
 
-def main():
-    print("=== Dynamic Scaling Test ===")
-    # 1. Определяем начальное количество контейнеров
-    initial_income = docker_ps_count("income-analyzer")
-    initial_risk = docker_ps_count("risk-evaluator")
-    print(f"[INFO] Initial containers: income-analyzer={initial_income}, risk-evaluator={initial_risk}")
+        # Ждём масштабирования вверх
+        def scaled_up():
+            current = docker_ps_count("income-analyzer")
+            return current > self.initial_income
 
-    # 2. Генерируем нагрузку – отправляем много параллельных запросов
-    print(f"[INFO] Sending {NUM_REQUESTS} parallel requests...")
-    start_time = time.time()
-    with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
-        futures = [executor.submit(send_request, f"test-load-{i}") for i in range(NUM_REQUESTS)]
-        results = [f.result() for f in futures]
-    success = [r for r in results if r]
-    print(f"[INFO] Sent requests: {len(success)}/{NUM_REQUESTS} successful, took {time.time()-start_time:.1f}s")
+        wait_for(scaled_up, MAX_WAIT_SCALE_UP,
+                 f"income-analyzer не увеличил количество контейнеров (исходное={self.initial_income})")
 
-    # 3. Ожидаем реакцию оркестратора: масштабирование вверх
-    up_ok_income = wait_for_scale_up("income-analyzer", initial_income)
-    up_ok_risk = wait_for_scale_up("risk-evaluator", initial_risk)
+    def test_scale_up_risk_evaluator(self):
+        """После нагрузки должен увеличиться и risk-evaluator."""
+        project = get_compose_project()
+        reset_scaler_redis_counters(project)
 
-    # 4. Ждём, пока очередь обработается (задачи с задержкой 2 секунды * 30 запросов)
-    print("[INFO] Waiting for all tasks to be processed (agents have 2s delay)...")
-    time.sleep(70)   # 30 задач * 2 сек = 60 сек + запас
+        # Два залпа: сначала заполняем пайплайн, потом добиваем — чтобы вырос active_risk в Redis
+        for batch in range(2):
+            with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
+                futures = [
+                    executor.submit(send_request, f"risk-{batch}-{i}")
+                    for i in range(NUM_REQUESTS)
+                ]
+                [f.result() for f in futures]
 
-    # 5. Проверяем уменьшение масштаба
-    down_ok_income = wait_for_scale_down("income-analyzer", initial_income)
-    down_ok_risk = wait_for_scale_down("risk-evaluator", initial_risk)
+            def scaled_up():
+                return docker_ps_count("risk-evaluator") > self.initial_risk
 
-    # 6. Анализируем логи оркестратора
-    check_orchestrator_logs()
+            try:
+                wait_for(
+                    scaled_up, 45,
+                    f"risk-evaluator (залп {batch + 1}, исходное={self.initial_risk})",
+                )
+                return
+            except Exception:
+                pass
+            time.sleep(15)
 
-    # Итог
-    if up_ok_income and up_ok_risk and down_ok_income and down_ok_risk:
-        print("\n[SUCCESS] Dynamic scaling test PASSED.")
-    else:
-        print("\n[FAIL] Dynamic scaling test FAILED. Check if agents have artificial delay (time.Sleep) and docker socket is accessible.")
-        print("Hint: For the test to work, agents must process tasks slower than the rate of incoming requests.")
-        print("      Add 'time.Sleep(2 * time.Second)' in income-analyzer and risk-evaluator handlers, then rebuild images.")
+        pytest.fail(
+            f"risk-evaluator не увеличил количество контейнеров (исходное={self.initial_risk})"
+        )
 
-if __name__ == "__main__":
-    main()
+    def test_scale_down(self):
+        """После обработки очереди контейнеры должны вернуться к исходному числу."""
+        # Даём время на обработку (30 задач * 2 сек каждая + запас)
+        time.sleep(70)
+
+        def income_back():
+            return docker_ps_count("income-analyzer") <= self.initial_income
+
+        def risk_back():
+            return docker_ps_count("risk-evaluator") <= self.initial_risk
+
+        wait_for(income_back, MAX_WAIT_SCALE_DOWN,
+                 f"income-analyzer не уменьшился до <= {self.initial_income}")
+        wait_for(risk_back, MAX_WAIT_SCALE_DOWN,
+                 f"risk-evaluator не уменьшился до <= {self.initial_risk}")
+
+    def test_orchestrator_logs(self):
+        """Проверяет наличие ключевых сообщений в логах оркестратора."""
+        # Если предыдущие тесты не дали scale-up risk — короткая нагрузка
+        project = get_compose_project()
+        with ThreadPoolExecutor(max_workers=NUM_REQUESTS) as executor:
+            futures = [
+                executor.submit(send_request, f"logs-{i}") for i in range(NUM_REQUESTS)
+            ]
+            [f.result() for f in futures]
+        time.sleep(25)
+
+        container = f"{project}-orchestrator-1"
+        try:
+            result = subprocess.run(
+                ["docker", "logs", container],
+                capture_output=True, text=True, check=True
+            )
+        except subprocess.CalledProcessError:
+            pytest.fail(f"Не удалось прочитать логи {container}")
+
+        # На Windows docker logs часто идёт в stderr
+        logs = result.stdout + result.stderr
+        assert "Scaling UP income-analyzer" in logs, (
+            "В логах оркестратора нет 'Scaling UP income-analyzer'"
+        )
+        assert "Scaling UP risk-evaluator" in logs, (
+            "В логах оркестратора нет 'Scaling UP risk-evaluator'"
+        )
+        assert "Scaling DOWN income-analyzer" in logs, (
+            "В логах оркестратора нет 'Scaling DOWN income-analyzer'"
+        )
+        assert "Scaling DOWN risk-evaluator" in logs, (
+            "В логах оркестратора нет 'Scaling DOWN risk-evaluator'"
+        )

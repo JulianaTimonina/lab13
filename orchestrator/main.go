@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sync"
 	"syscall"
 	"time"
 
@@ -27,18 +28,17 @@ var tracer = otel.Tracer("orchestrator")
 const (
 	maxIncomeReplicas = 5
 	maxRiskReplicas   = 5
-	incomeImage       = "lab13-income-analyzer:latest" // должно совпадать с build в compose
-	riskImage         = "lab13-risk-evaluator:latest"
-	networkName       = "scoring_net" // фиксированное имя сети (из docker-compose)
+	scaleUpActiveThreshold = 2 // активных шагов в Redis → масштабирование вверх
 )
 
 const (
-    activeIncomeKey = "scaler:active_income"
-    activeRiskKey   = "scaler:active_risk"
+	activeIncomeKey = "scaler:active_income"
+	activeRiskKey   = "scaler:active_risk"
 )
 
 // Docker HTTP client
 var dockerHTTP *http.Client
+var rdb = common.NewRedisClient()
 
 func init() {
 	// Создаём клиент, общающийся через Unix-сокет Docker
@@ -65,7 +65,7 @@ func main() {
 		log.Fatal(err)
 	}
 	defer nc.Close()
-	
+
 	if err := ensureStream(nc); err != nil {
 		log.Fatalf("Stream setup failed: %v", err)
 	}
@@ -75,77 +75,9 @@ func main() {
 	// Запуск REST API для тестирования
 	go startRESTServer(nc)
 
-	// Основная подписка на задачи (без изменений)
+	// Параллельная обработка: при нагрузке одновременно растут Redis-счётчики active_*
 	nc.Subscribe("scoring.request", func(msg *nats.Msg) {
-		ctx := common.ExtractTrace(msg)
-		ctx, span := tracer.Start(ctx, "orchestrator-pipeline")
-		defer span.End()
-
-		var req struct {
-			ClientID string `json:"client_id"`
-		}
-		if err := json.Unmarshal(msg.Data, &req); err != nil {
-			resp, _ := json.Marshal(map[string]string{"error": "invalid request"})
-			reply := &nats.Msg{Subject: msg.Reply, Data: resp}
-			common.InjectTrace(ctx, reply)
-			nc.PublishMsg(reply)
-			return
-		}
-
-		span.SetAttributes(attribute.String("client_id", req.ClientID))
-
-		clientData, err := collectData(ctx, nc, req.ClientID)
-		if err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"data collection failed"}`))
-			return
-		}
-
-		incomeMap, err := directStep(ctx, nc, "income", clientData)
-		if err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"income analysis failed"}`))
-			return
-		}
-		var incomeAnalysis common.IncomeAnalysis
-		if err := mapToStruct(incomeMap, &incomeAnalysis); err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"income parse failed"}`))
-			return
-		}
-
-		riskMap, err := directStep(ctx, nc, "risk", clientData)
-		if err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"risk assessment failed"}`))
-			return
-		}
-		var riskAssessment common.RiskAssessment
-		if err := mapToStruct(riskMap, &riskAssessment); err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"risk parse failed"}`))
-			return
-		}
-
-		decision, err := makeDecision(ctx, nc, incomeAnalysis, riskAssessment)
-		if err != nil {
-			nc.Publish(msg.Reply, []byte(`{"error":"decision failed"}`))
-			return
-		}
-
-		explanation, err := requestExplanation(ctx, nc, decision, clientData)
-		if err != nil {
-			explanation = "No explanation available"
-		}
-
-		result := common.ScoringResult{
-			Client:      *clientData,
-			Income:      incomeAnalysis,
-			Risk:        riskAssessment,
-			Decision:    *decision,
-			Explanation: explanation,
-		}
-
-		resultBytes, _ := json.Marshal(result)
-		reply := &nats.Msg{Subject: msg.Reply, Data: resultBytes}
-		common.InjectTrace(ctx, reply)
-		nc.PublishMsg(reply)
-		saveResult(ctx, result)
+		go processScoringRequest(nc, msg)
 	})
 
 	log.Println("Orchestrator started")
@@ -173,49 +105,48 @@ func collectData(ctx context.Context, nc *nats.Conn, clientID string) (*common.C
 }
 
 func directStep(
-    ctx context.Context,
-    nc *nats.Conn,
-    stepType string,
-    data interface{},
+	ctx context.Context,
+	nc *nats.Conn,
+	stepType string,
+	data interface{},
 ) (map[string]interface{}, error) {
 
-    ctx, span := tracer.Start(ctx, "directStep-"+stepType)
-    defer span.End()
+	ctx, span := tracer.Start(ctx, "directStep-"+stepType)
+	defer span.End()
 
-    // ---------- Добавленный блок: учёт активных задач ----------
-    rdb := common.NewRedisClient()
-    activeKey := activeIncomeKey
-    if stepType == "risk" {
-        activeKey = activeRiskKey
-    }
-    // Увеличиваем счётчик – сейчас началась обработка
-    rdb.Incr(ctx, activeKey)
-    // Гарантируем, что после выхода из функции счётчик уменьшится
-    defer rdb.Decr(ctx, activeKey)
-    // -----------------------------------------------------------
+	// ---------- Добавленный блок: учёт активных задач ----------
+	activeKey := activeIncomeKey
+	if stepType == "risk" {
+		activeKey = activeRiskKey
+	}
+	// Увеличиваем счётчик – сейчас началась обработка
+	rdb.Incr(ctx, activeKey)
+	// Гарантируем, что после выхода из функции счётчик уменьшится
+	defer rdb.Decr(ctx, activeKey)
+	// -----------------------------------------------------------
 
-    doSubject := stepType + ".analyze.do"
-    workReq, _ := json.Marshal(data)
+	doSubject := "scoring." + stepType + ".do"
+	workReq, _ := json.Marshal(data)
 
-    msg := &nats.Msg{
-        Subject: doSubject,
-        Data:    workReq,
-    }
+	msg := &nats.Msg{
+		Subject: doSubject,
+		Data:    workReq,
+	}
 
-    common.InjectTrace(ctx, msg)
+	common.InjectTrace(ctx, msg)
 
-    resp, err := nc.RequestMsg(msg, 10*time.Second)
-    if err != nil {
-        return nil, err
-    }
+	resp, err := nc.RequestMsg(msg, 30*time.Second)
+	if err != nil {
+		return nil, err
+	}
 
-    var result map[string]interface{}
+	var result map[string]interface{}
 
-    if err := json.Unmarshal(resp.Data, &result); err != nil {
-        return nil, err
-    }
+	if err := json.Unmarshal(resp.Data, &result); err != nil {
+		return nil, err
+	}
 
-    return result, nil
+	return result, nil
 }
 
 func makeDecision(ctx context.Context, nc *nats.Conn, income common.IncomeAnalysis, risk common.RiskAssessment) (*common.Decision, error) {
@@ -264,49 +195,160 @@ func mapToStruct(m map[string]interface{}, s interface{}) error {
 	return json.Unmarshal(data, s)
 }
 
+func processScoringRequest(nc *nats.Conn, msg *nats.Msg) {
+	ctx := common.ExtractTrace(msg)
+	ctx, span := tracer.Start(ctx, "orchestrator-pipeline")
+	defer span.End()
+
+	var req struct {
+		ClientID string `json:"client_id"`
+	}
+	if err := json.Unmarshal(msg.Data, &req); err != nil {
+		if msg.Reply != "" {
+			resp, _ := json.Marshal(map[string]string{"error": "invalid request"})
+			reply := &nats.Msg{Subject: msg.Reply, Data: resp}
+			common.InjectTrace(ctx, reply)
+			nc.PublishMsg(reply)
+		}
+		return
+	}
+
+	span.SetAttributes(attribute.String("client_id", req.ClientID))
+
+	clientData, err := collectData(ctx, nc, req.ClientID)
+	if err != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"data collection failed"}`))
+		}
+		return
+	}
+
+	// income и risk независимы (оба используют clientData) — параллельно для нагрузки на оба пула
+	var (
+		incomeMap, riskMap       map[string]interface{}
+		errIncome, errRisk       error
+		wg                       sync.WaitGroup
+	)
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		incomeMap, errIncome = directStep(ctx, nc, "income", clientData)
+	}()
+	go func() {
+		defer wg.Done()
+		riskMap, errRisk = directStep(ctx, nc, "risk", clientData)
+	}()
+	wg.Wait()
+
+	if errIncome != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"income analysis failed"}`))
+		}
+		return
+	}
+	var incomeAnalysis common.IncomeAnalysis
+	if err := mapToStruct(incomeMap, &incomeAnalysis); err != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"income parse failed"}`))
+		}
+		return
+	}
+
+	if errRisk != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"risk assessment failed"}`))
+		}
+		return
+	}
+	var riskAssessment common.RiskAssessment
+	if err := mapToStruct(riskMap, &riskAssessment); err != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"risk parse failed"}`))
+		}
+		return
+	}
+
+	decision, err := makeDecision(ctx, nc, incomeAnalysis, riskAssessment)
+	if err != nil {
+		if msg.Reply != "" {
+			nc.Publish(msg.Reply, []byte(`{"error":"decision failed"}`))
+		}
+		return
+	}
+
+	explanation, err := requestExplanation(ctx, nc, decision, clientData)
+	if err != nil {
+		explanation = "No explanation available"
+	}
+
+	result := common.ScoringResult{
+		Client:      *clientData,
+		Income:      incomeAnalysis,
+		Risk:        riskAssessment,
+		Decision:    *decision,
+		Explanation: explanation,
+	}
+
+	resultBytes, _ := json.Marshal(result)
+	if msg.Reply != "" {
+		reply := &nats.Msg{Subject: msg.Reply, Data: resultBytes}
+		common.InjectTrace(ctx, reply)
+		nc.PublishMsg(reply)
+	}
+	saveResult(ctx, result)
+}
+
 // ---------- Автомасштабирование через Docker HTTP API ----------
 func scalerLoop(nc *nats.Conn) {
-    rdb := common.NewRedisClient()
-    ticker := time.NewTicker(15 * time.Second)
-    defer ticker.Stop()
+	_ = nc
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
 
-    for range ticker.C {
-        // income-analyzer
-        valIncome, err := rdb.Get(context.Background(), activeIncomeKey).Int()
-        if err != nil {
-            valIncome = 0
-        }
-        currentIncome, _ := countContainers("income-analyzer")
-        log.Printf("income-analyzer: active=%d, running=%d", valIncome, currentIncome)
+	for range ticker.C {
+		ctx := context.Background()
 
-        if valIncome > 10 && currentIncome < maxIncomeReplicas {
-            if err := scaleUp("income-analyzer", incomeImage); err != nil {
-                log.Printf("Scale UP income-analyzer failed: %v", err)
-            }
-        } else if valIncome < 2 && currentIncome > 1 {
-            if err := scaleDown("income-analyzer"); err != nil {
-                log.Printf("Scale DOWN income-analyzer failed: %v", err)
-            }
-        }
+		activeIncome, _ := rdb.Get(ctx, activeIncomeKey).Int()
+		currentIncome, _ := countContainers("income-analyzer")
+		log.Printf("income-analyzer: active=%d, running=%d", activeIncome, currentIncome)
 
-        // risk-evaluator
-        valRisk, err := rdb.Get(context.Background(), activeRiskKey).Int()
-        if err != nil {
-            valRisk = 0
-        }
-        currentRisk, _ := countContainers("risk-evaluator")
-        log.Printf("risk-evaluator: active=%d, running=%d", valRisk, currentRisk)
+		if activeIncome > scaleUpActiveThreshold && currentIncome < maxIncomeReplicas {
+			image, err := resolveServiceImage("income-analyzer")
+			if err != nil {
+				log.Printf("Scale UP income-analyzer failed: resolve image: %v", err)
+			} else if err := scaleUp("income-analyzer", image); err != nil {
+				log.Printf("Scale UP income-analyzer failed: %v", err)
+			} else {
+				log.Printf("Scaling UP income-analyzer")
+			}
+		} else if activeIncome == 0 && currentIncome > 1 {
+			if err := scaleDown("income-analyzer"); err != nil {
+				log.Printf("Scale DOWN income-analyzer failed: %v", err)
+			} else {
+				log.Printf("Scaling DOWN income-analyzer")
+			}
+		}
 
-        if valRisk > 10 && currentRisk < maxRiskReplicas {
-            if err := scaleUp("risk-evaluator", riskImage); err != nil {
-                log.Printf("Scale UP risk-evaluator failed: %v", err)
-            }
-        } else if valRisk < 2 && currentRisk > 1 {
-            if err := scaleDown("risk-evaluator"); err != nil {
-                log.Printf("Scale DOWN risk-evaluator failed: %v", err)
-            }
-        }
-    }
+		activeRisk, _ := rdb.Get(ctx, activeRiskKey).Int()
+		currentRisk, _ := countContainers("risk-evaluator")
+		log.Printf("risk-evaluator: active=%d, running=%d", activeRisk, currentRisk)
+
+		if activeRisk > scaleUpActiveThreshold && currentRisk < maxRiskReplicas {
+			image, err := resolveServiceImage("risk-evaluator")
+			if err != nil {
+				log.Printf("Scale UP risk-evaluator failed: resolve image: %v", err)
+			} else if err := scaleUp("risk-evaluator", image); err != nil {
+				log.Printf("Scale UP risk-evaluator failed: %v", err)
+			} else {
+				log.Printf("Scaling UP risk-evaluator")
+			}
+		} else if activeRisk == 0 && currentRisk > 1 {
+			if err := scaleDown("risk-evaluator"); err != nil {
+				log.Printf("Scale DOWN risk-evaluator failed: %v", err)
+			} else {
+				log.Printf("Scaling DOWN risk-evaluator")
+			}
+		}
+	}
 }
 
 // countContainers возвращает количество работающих контейнеров с заданной меткой сервиса.
@@ -336,18 +378,98 @@ func countContainers(serviceName string) (int, error) {
 	return count, nil
 }
 
+// resolveServiceImage берёт тег образа из уже запущенного контейнера compose-сервиса.
+func resolveServiceImage(serviceName string) (string, error) {
+	ids, err := countContainersDetailed(serviceName)
+	if err != nil {
+		return "", err
+	}
+	if len(ids) == 0 {
+		return "", fmt.Errorf("no running container for %s", serviceName)
+	}
+	resp, err := dockerHTTP.Get("http://localhost/containers/" + ids[0] + "/json")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return "", fmt.Errorf("inspect container: status %d", resp.StatusCode)
+	}
+	var inspect struct {
+		Config struct {
+			Image string `json:"Image"`
+		} `json:"Config"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&inspect); err != nil {
+		return "", err
+	}
+	if inspect.Config.Image == "" {
+		return "", fmt.Errorf("empty image for %s", serviceName)
+	}
+	return inspect.Config.Image, nil
+}
+
+func resolveDockerNetwork() (string, error) {
+	if net := os.Getenv("DOCKER_NETWORK"); net != "" {
+		return net, nil
+	}
+	hostname, _ := os.Hostname()
+	if hostname == "" {
+		return "", fmt.Errorf("cannot detect orchestrator hostname")
+	}
+	resp, err := dockerHTTP.Get("http://localhost/containers/" + hostname + "/json")
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		// fallback: первый контейнер orchestrator по метке
+		ids, err := countContainersDetailed("orchestrator")
+		if err != nil || len(ids) == 0 {
+			return "", fmt.Errorf("inspect orchestrator network: status %d", resp.StatusCode)
+		}
+		resp, err = dockerHTTP.Get("http://localhost/containers/" + ids[0] + "/json")
+		if err != nil {
+			return "", err
+		}
+		defer resp.Body.Close()
+	}
+	var inspect struct {
+		NetworkSettings struct {
+			Networks map[string]struct{} `json:"Networks"`
+		} `json:"NetworkSettings"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&inspect); err != nil {
+		return "", err
+	}
+	for name := range inspect.NetworkSettings.Networks {
+		if name != "bridge" && name != "host" && name != "none" {
+			return name, nil
+		}
+	}
+	return "", fmt.Errorf("no compose network found on orchestrator")
+}
+
 // scaleUp создаёт и запускает ещё один контейнер агента.
 func scaleUp(serviceName, imageName string) error {
-	log.Printf("Scaling UP %s", serviceName)
+	networkName, err := resolveDockerNetwork()
+	if err != nil {
+		return fmt.Errorf("resolve network: %w", err)
+	}
+	log.Printf("Scaling UP %s (image=%s, network=%s)", serviceName, imageName, networkName)
 	containerName := fmt.Sprintf("%s-%d", serviceName, time.Now().UnixNano())
+
+	env := []string{
+		"NATS_URL=nats://nats:4222",
+		"JAEGER_ENDPOINT=jaeger:4317",
+	}
+	if serviceName == "risk-evaluator" {
+		env = append(env, "REDIS_URL=redis:6379")
+	}
 
 	createBody := map[string]interface{}{
 		"Image": imageName,
-		"Env": []string{
-			"NATS_URL=nats://nats:4222",
-			"REDIS_URL=redis:6379",
-			"JAEGER_ENDPOINT=jaeger:4317",
-		},
+		"Env":   env,
 		"Labels": map[string]string{
 			"com.docker.compose.service": serviceName,
 		},
@@ -446,88 +568,90 @@ func countContainersDetailed(serviceName string) ([]string, error) {
 }
 
 func startRESTServer(nc *nats.Conn) {
-    http.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
-        if r.Method != http.MethodPost {
-            http.Error(w, "POST only", http.StatusMethodNotAllowed)
-            return
-        }
-        body, _ := io.ReadAll(r.Body)
-        log.Printf("REST received body: %s", string(body))
-        var req struct{ ClientID string `json:"client_id"` }
-        if err := json.Unmarshal(body, &req); err != nil {
-            log.Printf("JSON parse error: %v", err)
-            http.Error(w, "invalid JSON", http.StatusBadRequest)
-            return
-        }
-        if req.ClientID == "" {
-            log.Printf("client_id empty")
-            http.Error(w, "client_id required", http.StatusBadRequest)
-            return
-        }
-        taskID := fmt.Sprintf("%d", time.Now().UnixNano())
-        task := map[string]string{"client_id": req.ClientID}
-        data, _ := json.Marshal(task)
-        nc.Publish("scoring.request", data)
-        w.Header().Set("Content-Type", "application/json")
-        json.NewEncoder(w).Encode(map[string]string{"task_id": taskID})
-    })
-    log.Fatal(http.ListenAndServe(":8080", nil))
+	http.HandleFunc("/start", func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost {
+			http.Error(w, "POST only", http.StatusMethodNotAllowed)
+			return
+		}
+		body, _ := io.ReadAll(r.Body)
+		log.Printf("REST received body: %s", string(body))
+		var req struct {
+			ClientID string `json:"client_id"`
+		}
+		if err := json.Unmarshal(body, &req); err != nil {
+			log.Printf("JSON parse error: %v", err)
+			http.Error(w, "invalid JSON", http.StatusBadRequest)
+			return
+		}
+		if req.ClientID == "" {
+			log.Printf("client_id empty")
+			http.Error(w, "client_id required", http.StatusBadRequest)
+			return
+		}
+		taskID := fmt.Sprintf("%d", time.Now().UnixNano())
+		task := map[string]string{"client_id": req.ClientID}
+		data, _ := json.Marshal(task)
+		nc.Publish("scoring.request", data)
+		w.Header().Set("Content-Type", "application/json")
+		json.NewEncoder(w).Encode(map[string]string{"task_id": taskID})
+	})
+	log.Fatal(http.ListenAndServe(":8080", nil))
 }
 
 func ensureStream(nc *nats.Conn) error {
-    js, err := nc.JetStream()
-    if err != nil {
-        return fmt.Errorf("failed to get JetStream context: %w", err)
-    }
+	js, err := nc.JetStream()
+	if err != nil {
+		return fmt.Errorf("failed to get JetStream context: %w", err)
+	}
 
-    // Создаём стрим, если его нет
-    _, err = js.StreamInfo("SCORING")
-    if err != nil {
-        streamConfig := &nats.StreamConfig{
-            Name:      "SCORING",
-            Subjects:  []string{"scoring.>"},
-            Retention: nats.LimitsPolicy,
-            MaxMsgs:   10000,
-            MaxBytes:  -1,
-            Discard:   nats.DiscardOld,
-            Storage:   nats.FileStorage,
-        }
-        _, err = js.AddStream(streamConfig)
-        if err != nil {
-            return fmt.Errorf("failed to create stream: %w", err)
-        }
-        log.Println("Stream SCORING created")
-    } else {
-        log.Println("Stream SCORING already exists")
-    }
+	// Создаём стрим, если его нет
+	_, err = js.StreamInfo("SCORING")
+	if err != nil {
+		streamConfig := &nats.StreamConfig{
+			Name:      "SCORING",
+			Subjects:  []string{"scoring.>"},
+			Retention: nats.LimitsPolicy,
+			MaxMsgs:   10000,
+			MaxBytes:  -1,
+			Discard:   nats.DiscardOld,
+			Storage:   nats.FileStorage,
+		}
+		_, err = js.AddStream(streamConfig)
+		if err != nil {
+			return fmt.Errorf("failed to create stream: %w", err)
+		}
+		log.Println("Stream SCORING created")
+	} else {
+		log.Println("Stream SCORING already exists")
+	}
 
-    // Создаём durable-консьюмеров, если их нет
-    consumers := map[string]string{
-        "income-workers": "income.analyze.do",
-        "risk-workers":   "risk.analyze.do",
-    }
+	// Создаём durable-консьюмеров, если их нет
+	consumers := map[string]string{
+		"income-workers": "scoring.income.do",
+		"risk-workers":   "scoring.risk.do",
+	}
 
-    for consumerName, filterSubject := range consumers {
-        _, err := js.ConsumerInfo("SCORING", consumerName)
-        if err != nil {
-            // Консьюмер не найден – создаём
-            _, err = js.AddConsumer("SCORING", &nats.ConsumerConfig{
-                Durable:        consumerName,
-                FilterSubject:  filterSubject,
-                AckPolicy:      nats.AckExplicitPolicy,
-                DeliverPolicy:  nats.DeliverAllPolicy,
-                ReplayPolicy:   nats.ReplayInstantPolicy,
-                MaxDeliver:     -1,
-                AckWait:        30 * time.Second,
-            })
-            if err != nil {
-                return fmt.Errorf("failed to create consumer %s: %w", consumerName, err)
-            }
-            log.Printf("Consumer %s created", consumerName)
-        } else {
-            log.Printf("Consumer %s already exists", consumerName)
-        }
-    }
+	for consumerName, filterSubject := range consumers {
+		_, err := js.ConsumerInfo("SCORING", consumerName)
+		if err != nil {
+			// Консьюмер не найден – создаём
+			_, err = js.AddConsumer("SCORING", &nats.ConsumerConfig{
+				Durable:       consumerName,
+				FilterSubject: filterSubject,
+				AckPolicy:     nats.AckExplicitPolicy,
+				DeliverPolicy: nats.DeliverAllPolicy,
+				ReplayPolicy:  nats.ReplayInstantPolicy,
+				MaxDeliver:    -1,
+				AckWait:       30 * time.Second,
+			})
+			if err != nil {
+				return fmt.Errorf("failed to create consumer %s: %w", consumerName, err)
+			}
+			log.Printf("Consumer %s created", consumerName)
+		} else {
+			log.Printf("Consumer %s already exists", consumerName)
+		}
+	}
 
-    return nil
+	return nil
 }
