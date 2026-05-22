@@ -11,6 +11,8 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"sort"
+	"strings"
 	"sync"
 	"syscall"
 	"time"
@@ -34,6 +36,7 @@ const (
 const (
 	activeIncomeKey = "scaler:active_income"
 	activeRiskKey   = "scaler:active_risk"
+	auctionWait     = 800 * time.Millisecond // окно сбора ставок
 )
 
 // Docker HTTP client
@@ -104,48 +107,113 @@ func collectData(ctx context.Context, nc *nats.Conn, clientID string) (*common.C
 	return &data, err
 }
 
-func directStep(
+func auctionSubject(stepType string) string {
+	return "auction." + stepType + ".analyze"
+}
+
+func agentWorkSubject(stepType, agentID string) string {
+	switch stepType {
+	case "income":
+		return "scoring.income.agent." + strings.TrimPrefix(agentID, "income-analyzer-")
+	case "risk":
+		return "scoring.risk.agent." + strings.TrimPrefix(agentID, "risk-evaluator-")
+	default:
+		return "scoring." + stepType + ".do"
+	}
+}
+
+func collectBids(ctx context.Context, nc *nats.Conn, subject string, payload []byte) ([]common.Bid, error) {
+	inbox := nats.NewInbox()
+	sub, err := nc.SubscribeSync(inbox)
+	if err != nil {
+		return nil, err
+	}
+	defer sub.Unsubscribe()
+
+	msg := &nats.Msg{Subject: subject, Data: payload, Reply: inbox}
+	common.InjectTrace(ctx, msg)
+	if err := nc.PublishMsg(msg); err != nil {
+		return nil, err
+	}
+
+	deadline := time.Now().Add(auctionWait)
+	var bids []common.Bid
+	for time.Now().Before(deadline) {
+		remaining := time.Until(deadline)
+		if remaining <= 0 {
+			break
+		}
+		m, err := sub.NextMsg(remaining)
+		if err != nil {
+			break
+		}
+		var bid common.Bid
+		if err := json.Unmarshal(m.Data, &bid); err != nil || bid.AgentID == "" {
+			continue
+		}
+		bids = append(bids, bid)
+	}
+	return bids, nil
+}
+
+// auctionStep: агенты торгуются → оркестратор выбирает лучшую ставку → задача победителю.
+func auctionStep(
 	ctx context.Context,
 	nc *nats.Conn,
 	stepType string,
 	data interface{},
 ) (map[string]interface{}, error) {
 
-	ctx, span := tracer.Start(ctx, "directStep-"+stepType)
+	ctx, span := tracer.Start(ctx, "auctionStep-"+stepType)
 	defer span.End()
 
-	// ---------- Добавленный блок: учёт активных задач ----------
 	activeKey := activeIncomeKey
 	if stepType == "risk" {
 		activeKey = activeRiskKey
 	}
-	// Увеличиваем счётчик – сейчас началась обработка
 	rdb.Incr(ctx, activeKey)
-	// Гарантируем, что после выхода из функции счётчик уменьшится
 	defer rdb.Decr(ctx, activeKey)
-	// -----------------------------------------------------------
 
-	doSubject := "scoring." + stepType + ".do"
-	workReq, _ := json.Marshal(data)
+	taskID := fmt.Sprintf("%s-%d", stepType, time.Now().UnixNano())
+	auctionReq := common.AuctionRequest{TaskID: taskID, Data: data}
+	payload, _ := json.Marshal(auctionReq)
 
-	msg := &nats.Msg{
-		Subject: doSubject,
-		Data:    workReq,
+	bids, err := collectBids(ctx, nc, auctionSubject(stepType), payload)
+	if err != nil {
+		return nil, fmt.Errorf("auction collect: %w", err)
+	}
+	if len(bids) == 0 {
+		return nil, fmt.Errorf("auction %s: no bids", stepType)
 	}
 
-	common.InjectTrace(ctx, msg)
-
-	resp, err := nc.RequestMsg(msg, 30*time.Second)
+	winner, err := common.SelectBestBid(bids)
 	if err != nil {
 		return nil, err
 	}
 
-	var result map[string]interface{}
+	sort.Slice(bids, func(i, j int) bool {
+		return common.BidScore(bids[i]) < common.BidScore(bids[j])
+	})
+	log.Printf(
+		"Auction %s: %d bids, winner=%s (cost=%.2f skill=%.2f avail=%.2f score=%.3f)",
+		stepType, len(bids), winner.AgentID, winner.Cost, winner.Skill, winner.Availability,
+		common.BidScore(winner),
+	)
 
+	workSubject := agentWorkSubject(stepType, winner.AgentID)
+	workReq, _ := json.Marshal(data)
+	workMsg := &nats.Msg{Subject: workSubject, Data: workReq}
+	common.InjectTrace(ctx, workMsg)
+
+	resp, err := nc.RequestMsg(workMsg, 30*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("dispatch to %s: %w", winner.AgentID, err)
+	}
+
+	var result map[string]interface{}
 	if err := json.Unmarshal(resp.Data, &result); err != nil {
 		return nil, err
 	}
-
 	return result, nil
 }
 
@@ -232,11 +300,11 @@ func processScoringRequest(nc *nats.Conn, msg *nats.Msg) {
 	wg.Add(2)
 	go func() {
 		defer wg.Done()
-		incomeMap, errIncome = directStep(ctx, nc, "income", clientData)
+		incomeMap, errIncome = auctionStep(ctx, nc, "income", clientData)
 	}()
 	go func() {
 		defer wg.Done()
-		riskMap, errRisk = directStep(ctx, nc, "risk", clientData)
+		riskMap, errRisk = auctionStep(ctx, nc, "risk", clientData)
 	}()
 	wg.Wait()
 

@@ -41,7 +41,9 @@ type AuctionRequest struct {
 }
 
 type Bid struct {
-    AgentID string  `json:"agent_id"`
-    Cost    float64 `json:"cost"`
-    Load    float64 `json:"load"`
+	AgentID      string  `json:"agent_id"`
+	Cost         float64 `json:"cost"`
+	Load         float64 `json:"load"`
+	Skill        float64 `json:"skill"`        // 0..1 — соответствие задаче
+	Availability float64 `json:"availability"` // 0..1 — свободная ёмкость
 }
