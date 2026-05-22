@@ -11,6 +11,7 @@ import (
     "credit-scoring/common"
     "go.opentelemetry.io/otel"
     "go.opentelemetry.io/otel/attribute"
+	"time"	//тесты
 )
 
 var tracer = otel.Tracer("income-analyzer")
@@ -45,6 +46,8 @@ func main() {
 
     _, err = nc.QueueSubscribe("income.analyze.do", "income-workers", func(msg *nats.Msg) {
 
+		time.Sleep(2 * time.Second)	//тесты
+		
 		atomic.AddInt64(&currentLoad, 1)
 		defer atomic.AddInt64(&currentLoad, -1)
 

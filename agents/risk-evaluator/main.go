@@ -55,6 +55,8 @@ func main() {
 
     _, err = nc.QueueSubscribe("risk.analyze.do", "risk-workers", func(msg *nats.Msg) {
 
+		time.Sleep(2 * time.Second)	//тесты
+
 		ctx := common.ExtractTrace(msg)
 
 		ctx, span := tracer.Start(ctx, "process-risk-evaluation")

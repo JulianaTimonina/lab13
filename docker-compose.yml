@@ -6,11 +6,16 @@ services:
     command: "-js"
     ports:
       - "4222:4222"
+      - "8222:8222"
+    networks:
+      - scoring_net
 
   redis:
     image: redis:alpine
     ports:
       - "6379:6379"
+    networks:
+      - scoring_net
 
   jaeger:
     image: jaegertracing/all-in-one:latest
@@ -20,55 +25,91 @@ services:
       - "4318:4318"
     environment:
       - COLLECTOR_OTLP_ENABLED=true
+    networks:
+      - scoring_net
 
   data-collector:
     build:
       context: .
       dockerfile: agents/data-collector/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - JAEGER_ENDPOINT=jaeger:4317
     depends_on:
       - nats
+    networks:
+      - scoring_net
 
   income-analyzer:
     build:
       context: .
       dockerfile: agents/income-analyzer/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - JAEGER_ENDPOINT=jaeger:4317
     depends_on:
       - nats
+    networks:
+      - scoring_net
 
   risk-evaluator:
     build:
       context: .
       dockerfile: agents/risk-evaluator/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis:6379
+      - JAEGER_ENDPOINT=jaeger:4317
     depends_on:
       - nats
       - redis
+    networks:
+      - scoring_net
 
   decision-maker:
     build:
       context: .
       dockerfile: agents/decision-maker/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - JAEGER_ENDPOINT=jaeger:4317
     depends_on:
       - nats
+    networks:
+      - scoring_net
 
   orchestrator:
     build:
       context: .
       dockerfile: orchestrator/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis:6379
+      - JAEGER_ENDPOINT=jaeger:4317
+      - HTTP_PORT=8080
+    ports:
+      - "8080:8080"
     depends_on:
       - nats
       - redis
     volumes:
-      - /var/run/docker.sock:/var/run/docker.sock
+      - /var/run/docker.sock:/var/run/docker.sock   # <-- обязательно
+    networks:
+      - scoring_net
 
   llm-agent:
     build:
       context: .
       dockerfile: agents/llm-agent/Dockerfile
+    environment:
+      - NATS_URL=nats://nats:4222
+      - JAEGER_ENDPOINT=jaeger:4317
+      - GROQ_API_KEY=${GROQ_API_KEY}
     depends_on:
       - nats
       - jaeger
-    environment:
-      - GROQ_API_KEY=${GROQ_API_KEY}
+    networks:
+      - scoring_net
 
   web-ui:
     build:
@@ -76,6 +117,15 @@ services:
       dockerfile: web-ui/Dockerfile
     ports:
       - "8501:8501"
+    environment:
+      - NATS_URL=nats://nats:4222
+      - REDIS_URL=redis:6379
     depends_on:
       - nats
       - redis
+    networks:
+      - scoring_net
+
+networks:
+  scoring_net:
+    driver: bridge
