@@ -43,29 +43,43 @@ func main() {
         nc.Publish(msg.Reply, bidBytes)
     })
 
-    // Рабочая очередь
     _, err = nc.QueueSubscribe("income.analyze.do", "income-workers", func(msg *nats.Msg) {
-        atomic.AddInt64(&currentLoad, 1)
-        defer atomic.AddInt64(&currentLoad, -1)
 
-        _, span := tracer.Start(context.Background(), "process-income-analysis")
-        defer span.End()
+		atomic.AddInt64(&currentLoad, 1)
+		defer atomic.AddInt64(&currentLoad, -1)
 
-        var data common.ClientData
-        if err := json.Unmarshal(msg.Data, &data); err != nil {
-            log.Printf("invalid message: %v", err)
-            return
-        }
-        span.SetAttributes(attribute.String("client_id", data.ClientID))
+		ctx := common.ExtractTrace(msg)
 
-        analysis := common.IncomeAnalysis{
-            StabilityScore: 0.85,
-            DebtToIncome:   data.Income * 0.3 / 5000,
-            ApprovedAmount: data.Income * 3,
-        }
-        resp, _ := json.Marshal(analysis)
-        nc.Publish(msg.Reply, resp)
-    })
+		ctx, span := tracer.Start(ctx, "process-income-analysis")
+		defer span.End()
+
+		var data common.ClientData
+
+		if err := json.Unmarshal(msg.Data, &data); err != nil {
+			return
+		}
+
+		span.SetAttributes(
+			attribute.String("client_id", data.ClientID),
+		)
+
+		analysis := common.IncomeAnalysis{
+			StabilityScore: 0.85,
+			DebtToIncome:   data.Income * 0.3 / 5000,
+			ApprovedAmount: data.Income * 3,
+		}
+
+		resp, _ := json.Marshal(analysis)
+
+		reply := &nats.Msg{
+			Subject: msg.Reply,
+			Data:    resp,
+		}
+
+		common.InjectTrace(ctx, reply)
+
+		nc.PublishMsg(reply)
+	})
     if err != nil {
         log.Fatal(err)
     }

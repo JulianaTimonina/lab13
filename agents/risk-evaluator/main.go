@@ -53,35 +53,50 @@ func main() {
         nc.Publish(msg.Reply, b)
     })
 
-    // Рабочая очередь
     _, err = nc.QueueSubscribe("risk.analyze.do", "risk-workers", func(msg *nats.Msg) {
-		log.Printf("Received risk request: %s", string(msg.Data))
-        _, span := tracer.Start(context.Background(), "process-risk-evaluation")
-        defer span.End()
 
-        var data common.ClientData
+		ctx := common.ExtractTrace(msg)
+
+		ctx, span := tracer.Start(ctx, "process-risk-evaluation")
+		defer span.End()
+
+		var data common.ClientData
+
 		if err := json.Unmarshal(msg.Data, &data); err != nil {
-			log.Printf("Unmarshal error: %v", err)
 			return
 		}
-		log.Printf("Parsed client: %+v", data)
-        span.SetAttributes(attribute.String("client_id", data.ClientID))
 
-        assessment := common.RiskAssessment{
-            RiskScore: 0.2,
-            RiskLevel: "low",
-            Factors:   []string{"good credit history", "stable income"},
-        }
-        resp, _ := json.Marshal(assessment)
-		log.Printf("Sending assessment: %+v", assessment)
-        msg.Respond(resp)
+		span.SetAttributes(
+			attribute.String("client_id", data.ClientID),
+		)
 
-        stateMutex.Lock()
-        state.TotalEvaluated++
-        state.LastEvaluated = time.Now()
-        stateMutex.Unlock()
-        saveState(ctx)
-    })
+		assessment := common.RiskAssessment{
+			RiskScore: 0.2,
+			RiskLevel: "low",
+			Factors: []string{
+				"good credit history",
+				"stable income",
+			},
+		}
+
+		resp, _ := json.Marshal(assessment)
+
+		reply := &nats.Msg{
+			Subject: msg.Reply,
+			Data:    resp,
+		}
+
+		common.InjectTrace(ctx, reply)
+
+		nc.PublishMsg(reply)
+
+		stateMutex.Lock()
+		state.TotalEvaluated++
+		state.LastEvaluated = time.Now()
+		stateMutex.Unlock()
+
+		saveState(ctx)
+	})
     if err != nil {
         log.Fatal(err)
     }
